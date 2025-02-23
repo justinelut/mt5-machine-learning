@@ -140,10 +140,12 @@ plt.legend()
 plt.grid(True)
 plt.show()
 
-print(f"Starting Capital: $100")
-print(f"Final Capital: ${capital:.2f}")
-print(f"Total Return: {((capital/100)-1)*100:.2f}%")
+
 
 print("Trade Signals:")
 for sig in trade_signals:
     print(sig)
+
+print(f"Starting Capital: $100")
+print(f"Final Capital: ${capital:.2f}")
+print(f"Total Return: {((capital/100)-1)*100:.2f}%")

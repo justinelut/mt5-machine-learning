@@ -1,5 +1,5 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Suppress TensorFlow warnings
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
@@ -10,13 +10,14 @@ from tensorflow import keras
 from sklearn.preprocessing import StandardScaler
 import ta
 import joblib
+import matplotlib.pyplot as plt
 from pprint import pprint
 
 # ------------------------------
 # Initialize MT5 Connection
 # ------------------------------
 def init_mt5():
-    # Replace these with your MT5 account credentials
+    # Replace with your MT5 credentials
     MT5_ACCOUNT = 208552812
     MT5_PASSWORD = "Ch!L$ea#1.Shant"
     MT5_SERVER = "ExnessKE-MT5Trial9"
@@ -27,7 +28,6 @@ def init_mt5():
         
     print("MT5 initialized successfully!")
     
-    # Attempt login
     authorized = mt5.login(login=MT5_ACCOUNT, password=MT5_PASSWORD, server=MT5_SERVER)
     if not authorized:
         print(f"Login failed: {mt5.last_error()}")
@@ -35,7 +35,9 @@ def init_mt5():
         quit()
     
     print(f"Connected to account #{MT5_ACCOUNT}")
-    print(f"Account Balance: {mt5.account_info().balance}")
+    account_info = mt5.account_info()
+    print(f"Account Balance: {account_info.balance:.2f}")
+    print(f"Free Margin: {account_info.margin_free:.2f}")
     return True
 
 # ------------------------------
@@ -44,15 +46,14 @@ def init_mt5():
 SYMBOL = "EURUSDm"
 TIMEFRAME = mt5.TIMEFRAME_M5
 RISK_PERCENT = 0.02  # 2% risk per trade
-MAX_SPREAD = 2.0  # Max allowed spread in pips
-TAKE_PROFIT_PIPS = 20
-STOP_LOSS_PIPS = 10
+MIN_CONFIDENCE_BUY = 0.55
+MIN_CONFIDENCE_SELL = 0.45
+DATA_WINDOW_DAYS = 10  # Match backtester's 10-day window
 
 # ------------------------------
-# Feature Engineering
+# Feature Engineering (Same as Backtester)
 # ------------------------------
 def process_features(df):
-    # Technical indicators calculation
     df['sma_20'] = ta.trend.sma_indicator(df['close'], window=20)
     df['ema_10'] = ta.trend.ema_indicator(df['close'], window=10)
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
@@ -63,7 +64,7 @@ def process_features(df):
     df['boll_lower'] = ta.volatility.bollinger_lband(df['close'], window=20)
     df['spread'] = df['close'] - df['open']
     df['volume_delta'] = df['tick_volume'].diff()
-    df['doji'] = (abs(df['open'] - df['close']) <= (df['high'] - df['low'])*0.1).astype(int)
+    df['doji'] = (abs(df['open'] - df['close']) <= (df['high'] - df['low']) * 0.1).astype(int)
     df['bullish_engulfing'] = ((df['close'].shift(1) < df['open'].shift(1)) &
                                (df['close'] > df['open']) &
                                (df['close'] > df['open'].shift(1)) &
@@ -75,118 +76,109 @@ def process_features(df):
     return df.dropna()
 
 # ------------------------------
-# Trading Utilities
+# Trading Utilities (Enhanced)
 # ------------------------------
-def get_symbol_data(symbol):
-    """Retrieve and validate symbol information"""
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        print(f"Symbol {symbol} not found")
-        return None
-    if not symbol_info.visible:
-        print(f"Symbol {symbol} is not visible, trying to switch on")
-        if not mt5.symbol_select(symbol, True):
-            print(f"Failed to select {symbol}")
-            return None
-    return symbol_info
-
-def get_current_tick(symbol):
-    """Get current tick data with error handling"""
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        print(f"Failed to get tick data for {symbol}: {mt5.last_error()}")
-        return None
-    return tick
-
-def calculate_position_size(symbol, risk_percent, stop_loss_pips):
-    """Calculate proper position size based on risk management"""
-    symbol_info = mt5.symbol_info(symbol)
-    account_balance = mt5.account_info().balance
-    risk_amount = account_balance * risk_percent
+def calculate_position_size(entry_price, stop_loss_pips):
+    account = mt5.account_info()
+    if not account:
+        return 0.0
     
-    # Calculate pip value
-    pip_value = mt5.market_book(symbol).data[0].price * 0.0001
-    
-    # Calculate position size
+    risk_amount = account.balance * RISK_PERCENT
+    pip_value = (entry_price * 0.0001)  # For EURUSD
     position_size = risk_amount / (stop_loss_pips * pip_value)
+    
+    # Get symbol info
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if not symbol_info:
+        return 0.0
+    
+    # Apply lot size constraints
+    position_size = np.clip(position_size, 
+                           symbol_info.volume_min, 
+                           symbol_info.volume_max)
     return round(position_size, 2)
 
-def send_trade_order(order_type, symbol, lot_size, sl_pips, tp_pips):
-    """Execute trade with proper order handling"""
-    symbol_info = mt5.symbol_info(symbol)
-    point = symbol_info.point
-    price = mt5.symbol_info_tick(symbol).ask if order_type == 'BUY' else mt5.symbol_info_tick(symbol).bid
+def execute_trade(signal_type, entry_price):
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if not symbol_info:
+        return None
+    
+    # Calculate dynamic stop loss (2% price movement)
+    stop_loss_pips = 20  # Fixed SL like backtester's 1 candle
+    take_profit_pips = 40  # Fixed TP like backtester's 2 candles
+    
+    lot_size = calculate_position_size(entry_price, stop_loss_pips)
+    if lot_size <= 0:
+        return None
     
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
+        "symbol": SYMBOL,
         "volume": lot_size,
-        "type": mt5.ORDER_TYPE_BUY if order_type == 'BUY' else mt5.ORDER_TYPE_SELL,
-        "price": price,
-        "sl": price - sl_pips * point if order_type == 'BUY' else price + sl_pips * point,
-        "tp": price + tp_pips * point if order_type == 'BUY' else price - tp_pips * point,
+        "type": mt5.ORDER_TYPE_BUY if signal_type == 'BUY' else mt5.ORDER_TYPE_SELL,
+        "price": entry_price,
+        "sl": entry_price - (stop_loss_pips * 0.0001) if signal_type == 'BUY' else entry_price + (stop_loss_pips * 0.0001),
+        "tp": entry_price + (take_profit_pips * 0.0001) if signal_type == 'BUY' else entry_price - (take_profit_pips * 0.0001),
         "deviation": 20,
         "magic": 202404,
-        "comment": "AI-Trade",
+        "comment": "LiveTrade",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_FOK,
     }
     
     result = mt5.order_send(request)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"Order failed: {result.comment}")
-        return None
     return result
 
 # ------------------------------
-# Main Trading Logic
+# Live Trading Core
 # ------------------------------
-def main():
-    # Initialize MT5 connection
+def live_trading():
+    # Initialize connections
     if not init_mt5():
         return
     
-    # Load AI model and scaler
+    # Load model components
     model = keras.models.load_model("atlas_trading_model.keras")
     scaler = joblib.load("scaler.pkl")
     
-    print("\n=== Trading Bot Started ===")
+    print("\n=== Live Trading Started ===")
     print(f"Symbol: {SYMBOL}")
-    print(f"Timeframe: {TIMEFRAME}")
-    print(f"Risk Management: {RISK_PERCENT*100}% per trade")
+    print(f"Timeframe: M5")
+    print(f"Risk per Trade: {RISK_PERCENT*100}%")
     
     last_bar_time = None
+    trade_active = False
+    capital_history = [mt5.account_info().balance]
+    
     while True:
         try:
-            # Check symbol availability
-            if not get_symbol_data(SYMBOL):
-                time.sleep(10)
+            # Get fresh data
+            end_time = dt.datetime.now()
+            start_time = end_time - dt.timedelta(days=DATA_WINDOW_DAYS)
+            rates = mt5.copy_rates_range(SYMBOL, TIMEFRAME, start_time, end_time)
+            
+            if rates is None or len(rates) < 100:
+                print("Data retrieval failed, retrying...")
+                time.sleep(5)
                 continue
-                
-            # Get current market data
-            rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1000)
-            if rates is None:
-                print("Failed to get market data")
-                time.sleep(60)
-                continue
-                
-            # Process data
+            
             df = pd.DataFrame(rates)
             df['time'] = pd.to_datetime(df['time'], unit='s')
             df.set_index('time', inplace=True)
             
-            # Check for new bar
-            if df.index[-1] == last_bar_time:
-                time.sleep(10)
+            # Check for new candle
+            current_bar_time = df.index[-1]
+            if current_bar_time == last_bar_time:
+                time.sleep(1)
                 continue
-            last_bar_time = df.index[-1]
+            last_bar_time = current_bar_time
             
-            # Feature engineering
+            # Process features
             df_processed = process_features(df.copy())
             if df_processed.empty:
                 continue
-                
-            # Prepare AI input
+            
+            # Prepare prediction input
             features = ['sma_20', 'ema_10', 'rsi', 'macd', 'macd_signal', 
                        'atr', 'boll_upper', 'boll_lower', 'spread', 
                        'volume_delta', 'doji', 'bullish_engulfing', 'bearish_engulfing']
@@ -194,48 +186,57 @@ def main():
             
             # Get prediction
             prediction = model.predict(X_live, verbose=0)[0][0]
-            confidence = abs(prediction - 0.5) * 2  # 0-1 confidence
+            current_price = mt5.symbol_info_tick(SYMBOL).ask
             
-            print(f"\n[{dt.datetime.now()}] New Bar Analysis:")
-            print(f"Close Price: {df['close'].iloc[-1]:.5f}")
-            print(f"AI Prediction: {prediction:.4f}")
-            print(f"Confidence: {confidence:.2%}")
+            print(f"\n[{dt.datetime.now()}] New Candle:")
+            print(f"Price: {current_price:.5f}")
+            print(f"Prediction: {prediction:.4f}")
             
             # Check existing positions
             positions = mt5.positions_get(symbol=SYMBOL)
             if positions and len(positions) > 0:
-                print(f"Existing positions open: {len(positions)}")
+                print("Position already open, skipping...")
+                capital_history.append(mt5.account_info().balance)
+                time.sleep(1)
                 continue
-                
-            # Trade execution logic
-            if prediction > 0.55 and confidence > 0.3:
-                trade_type = 'BUY'
-            elif prediction < 0.45 and confidence > 0.3:
-                trade_type = 'SELL'
+            
+            # Generate trade signal (matching backtester logic)
+            if prediction > MIN_CONFIDENCE_BUY:
+                signal = 'BUY'
+                entry_price = mt5.symbol_info_tick(SYMBOL).ask
+            elif prediction < MIN_CONFIDENCE_SELL:
+                signal = 'SELL'
+                entry_price = mt5.symbol_info_tick(SYMBOL).bid
             else:
-                print("No valid trading signal")
+                print("No valid signal")
+                time.sleep(1)
                 continue
-                
-            # Calculate position size
-            lot_size = calculate_position_size(SYMBOL, RISK_PERCENT, STOP_LOSS_PIPS)
-            print(f"\n=== Executing {trade_type} Order ===")
-            print(f"Lot Size: {lot_size}")
-            print(f"Stop Loss: {STOP_LOSS_PIPS} pips")
-            print(f"Take Profit: {TAKE_PROFIT_PIPS} pips")
             
             # Execute trade
-            result = send_trade_order(trade_type, SYMBOL, lot_size, STOP_LOSS_PIPS, TAKE_PROFIT_PIPS)
-            if result:
-                print(f"\nTrade Executed Successfully:")
-                pprint(result._asdict())
-                print(f"New Balance: {mt5.account_info().balance:.2f}")
+            result = execute_trade(signal, entry_price)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"\n=== {signal} Order Executed ===")
+                print(f"Entry Price: {entry_price:.5f}")
+                print(f"Volume: {result.volume:.2f} lots")
+                print(f"SL: {result.sl:.5f}")
+                print(f"TP: {result.tp:.5f}")
+                capital_history.append(mt5.account_info().balance)
                 
-            time.sleep(10)  # Check every 10 seconds
-            
+                # Plot update
+                plt.figure(figsize=(10,5))
+                plt.plot(capital_history)
+                plt.title('Live Capital Growth')
+                plt.xlabel('Trade Count')
+                plt.ylabel('Balance')
+                plt.pause(0.01)
+                
+            time.sleep(1)
+
         except Exception as e:
-            print(f"Critical Error: {str(e)}")
-            time.sleep(60)
+            print(f"Error: {str(e)}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    live_trading()
     mt5.shutdown()
+    print("Trading Terminated")

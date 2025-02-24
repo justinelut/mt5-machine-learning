@@ -128,7 +128,7 @@ df = process_features(df)
 if df is not None:
     df = predict_trades(df)
     if df is not None:
-        df = calculate_profit(df, starting_capital=1000, lot_size=1)  # Adjust initial capital if needed
+        df = calculate_profit(df, starting_capital=10 00, lot_size=1)  # Adjust initial capital if needed
         print(df[['time', 'close', 'prediction', 'position', 'capital']].tail(10))  # Show last 10 results
         df.to_csv("predicted_trades.csv", index=False)  # Save results
         plot_results(df)  # Show results
